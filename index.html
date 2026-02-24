@@ -76,7 +76,17 @@
       <div class="ph-txt">SELECCIONÁ UN CANAL</div>
     </div>
     <div id="loading"><div class="spinner"></div><div class="loading-txt" id="loading-txt">CARGANDO...</div></div>
-    <iframe id="frame" style="display:none" allowfullscreen allow="autoplay; fullscreen; picture-in-picture; encrypted-media"></iframe>
+    <!--
+      CLAVE: el iframe apunta DIRECTO a la URL original (la14hd.com)
+      El HTML que recibe ya viene limpio — el proxy eliminó los scripts
+      de tiogolhd ANTES de que lleguen al navegador.
+      Así el stream .m3u8 carga desde su origen correcto sin errores.
+    -->
+    <iframe id="frame" style="display:none"
+      allowfullscreen
+      allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+      referrerpolicy="no-referrer-when-downgrade">
+    </iframe>
   </div>
   <div class="url-bar">
     <input id="url-input" type="url" placeholder="https://sitio.com/stream...">
@@ -109,156 +119,134 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════
-// PROXY URLS — usamos allorigins.win que es un proxy CORS gratuito
-// que corre server-side, descarga la página y nos la devuelve
-// permitiéndonos modificarla antes de mostrarla
+// PROXY CORS gratuito — descarga el HTML server-side
 // ═══════════════════════════════════════════════════════════════════
-
-// allorigins.win: proxy CORS gratuito, sin límites, sin registro
 const PROXY = 'https://api.allorigins.win/get?url=';
 
 // ═══════════════════════════════════════════════════════════════════
-// SCRIPT ANTI-ADS que se inyecta DENTRO del HTML descargado
-// Como lo inyectamos antes de servirlo al iframe, corre en el
-// mismo origen y puede eliminar cualquier cosa
+// PASO 1: Eliminar scripts de ads del HTML crudo (regex)
+// Se hace ANTES de que el navegador los vea — nunca llegan a ejecutar
+// ═══════════════════════════════════════════════════════════════════
+function stripAdScripts(html) {
+  return html
+    // Eliminar cualquier <script> que cargue tiogolhd o aclib
+    .replace(/<script[^>]*tiogolhd[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*aclib[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*block\.js[^>]*>[\s\S]*?<\/script>/gi, '')
+    // Eliminar otros ad networks conocidos
+    .replace(/<script[^>]*popads\.net[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*exoclick[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*adsterra[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*propellerads[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*hilltopads[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*trafficjunky[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*clickadu[^>]*>[\s\S]*?<\/script>/gi, '')
+    // Eliminar llamadas inline a aclib
+    .replace(/aclib\.run\w*\s*\(\s*\{[\s\S]*?\}\s*\)\s*;?/g, '')
+    // Eliminar iframes de ads
+    .replace(/<iframe[^>]*tiogolhd[^>]*>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<iframe[^>]*popads[^>]*>[\s\S]*?<\/iframe>/gi, '');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 2: Script que se inyecta DENTRO del HTML limpio
+// Por si queda algún ad dinámico que se inyecte después de cargar
 // ═══════════════════════════════════════════════════════════════════
 const AD_KILLER = `<script>
 (function(){
   if(window.__ak) return;
   window.__ak = true;
 
-  /* ── Neutralizar aclib ANTES de que cargue ── */
-  window.aclib = {
-    runPop:     function(){ return; },
-    runBanner:  function(){ return; },
-    runInterstitial: function(){ return; },
-    runSlider:  function(){ return; },
-  };
+  /* Neutralizar aclib por si quedó alguna referencia */
+  window.aclib = { runPop:function(){}, runBanner:function(){},
+                   runInterstitial:function(){}, runSlider:function(){} };
 
-  /* ── Bloquear window.open → sin popups ── */
+  /* Sin popups */
   window.open = function(){ return null; };
-  window.alert = function(){};
-  window.confirm = function(){ return false; };
 
-  /* ── Bloquear document.write ── */
-  document.write = function(){};
-  document.writeln = function(){};
-
-  /* ── Eliminar scripts de tiogolhd antes de que ejecuten ── */
-  document.addEventListener('beforescriptexecute', function(e){
-    var src = (e.target.src||'');
-    if(src.indexOf('tiogolhd')>-1 || src.indexOf('aclib')>-1){
-      e.preventDefault();
-    }
-  }, true);
-
-  /* ── Interceptar createElement para bloquear scripts inyectados ── */
-  var _createElement = document.createElement.bind(document);
+  /* Interceptar createElement para bloquear scripts inyectados dinámicamente */
+  var _ce = document.createElement.bind(document);
   document.createElement = function(tag){
-    var el = _createElement(tag);
-    if(tag.toLowerCase()==='script'){
-      var _setSrc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,'src');
-      Object.defineProperty(el,'src',{
+    var el = _ce(tag);
+    if((tag+'').toLowerCase() === 'script'){
+      Object.defineProperty(el, 'src', {
         set: function(v){
           if(v && (v.indexOf('tiogolhd')>-1 || v.indexOf('aclib')>-1 ||
-                   v.indexOf('block.js')>-1 || v.indexOf('popads')>-1 ||
-                   v.indexOf('exoclick')>-1 || v.indexOf('adsterra')>-1)){
-            /* No hacer nada — script bloqueado */
-            return;
+             v.indexOf('popads')>-1 || v.indexOf('exoclick')>-1 ||
+             v.indexOf('adsterra')>-1 || v.indexOf('hilltopads')>-1)){
+            return; /* bloqueado */
           }
-          _setSrc.set.call(this, v);
+          Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,'src').set.call(this,v);
         },
-        get: function(){ return _setSrc.get.call(this); }
+        get: function(){
+          return Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,'src').get.call(this);
+        }
       });
     }
     return el;
   };
 
-  /* ── Eliminar capas de publicidad del DOM ── */
+  /* Eliminar capas de publicidad del DOM */
   function isPlayer(el){
-    if(!el) return false;
-    var t=(el.tagName||'').toLowerCase();
-    if(t==='video'||t==='audio') return true;
-    if(el.querySelector&&el.querySelector('video,audio')) return true;
-    var s=(el.id+' '+el.className).toLowerCase();
-    return s.indexOf('player')>-1||s.indexOf('jw-')>-1||s.indexOf('vjs')>-1;
+    var s = ((el.id||'')+(el.className||'')).toLowerCase();
+    return el.tagName==='VIDEO'||el.tagName==='AUDIO'||
+           (el.querySelector&&!!el.querySelector('video'))||
+           s.indexOf('player')>-1||s.indexOf('jw-')>-1||s.indexOf('vjs')>-1;
   }
   function killAds(){
     if(!document.body) return;
-    document.querySelectorAll('div,section,aside,span').forEach(function(el){
+    document.querySelectorAll('div,section,aside').forEach(function(el){
       if(isPlayer(el)) return;
       try{
-        var st=getComputedStyle(el);
-        if(st.display==='none'||st.visibility==='hidden') return;
-        var zi=parseInt(st.zIndex)||0;
-        if((st.position==='fixed'||st.position==='absolute')&&zi>5){
-          var r=el.getBoundingClientRect();
-          if(r.width<window.innerWidth*0.2||r.height<window.innerHeight*0.2) return;
+        var st = getComputedStyle(el);
+        if(st.display==='none') return;
+        var zi = parseInt(st.zIndex)||0;
+        if((st.position==='fixed'||st.position==='absolute') && zi>5){
+          var r = el.getBoundingClientRect();
+          if(r.width < window.innerWidth*0.25 || r.height < window.innerHeight*0.25) return;
           if(isPlayer(el)) return;
-          var ext=false;
-          el.querySelectorAll('a[href]').forEach(function(a){
-            var h=a.getAttribute('href')||'';
-            if(h&&h.indexOf('javascript')===-1&&h.indexOf(location.hostname)===-1&&h.match(/^https?:/)) ext=true;
+          var hasExt = Array.from(el.querySelectorAll('a[href]')).some(function(a){
+            var h = a.getAttribute('href')||'';
+            return h && h.indexOf('javascript')===-1 &&
+                   h.indexOf(location.hostname)===-1 && /^https?:/.test(h);
           });
-          if(ext||zi>50){
-            el.style.cssText='display:none!important;pointer-events:none!important';
-            try{el.remove();}catch(e){}
+          if(hasExt || zi > 50){
+            el.style.cssText = 'display:none!important;pointer-events:none!important';
+            try{ el.remove(); }catch(e){}
           }
         }
       }catch(e){}
     });
   }
 
-  /* ── Interceptar clicks en links externos ── */
-  document.addEventListener('click',function(e){
-    var t=e.target;
+  /* Bloquear clicks en links externos */
+  document.addEventListener('click', function(e){
+    var t = e.target;
     for(var i=0;i<8;i++){
-      if(!t||t===document.body) break;
+      if(!t || t===document.body) break;
       if(t.tagName==='A'){
-        var h=t.getAttribute('href')||'';
-        if(h&&h.indexOf('javascript')===-1&&h.indexOf('#')===-1&&
-           h.indexOf(location.hostname)===-1&&h.match(/^https?:/)){
+        var h = t.getAttribute('href')||'';
+        if(h && h.indexOf('javascript')===-1 && h.indexOf('#')===-1 &&
+           h.indexOf(location.hostname)===-1 && /^https?:/.test(h)){
           e.preventDefault(); e.stopImmediatePropagation(); return;
         }
       }
-      t=t.parentElement;
+      t = t.parentElement;
     }
-  },true);
+  }, true);
 
   killAds();
   setInterval(killAds, 500);
-  var mo=new MutationObserver(function(m){
+  var mo = new MutationObserver(function(m){
     m.forEach(function(r){ if(r.addedNodes.length) setTimeout(killAds,60); });
   });
-  function startObs(){
-    if(document.body) mo.observe(document.body,{childList:true,subtree:true});
-  }
-  if(document.body) startObs();
-  else document.addEventListener('DOMContentLoaded',startObs);
-
+  function obs(){ if(document.body) mo.observe(document.body,{childList:true,subtree:true}); }
+  document.body ? obs() : document.addEventListener('DOMContentLoaded', obs);
 })();
 <\/script>`;
 
 // ═══════════════════════════════════════════════════════════════════
-// TAMBIÉN eliminar los tags <script> de tiogolhd del HTML crudo
-// antes de inyectarlo en el iframe
-// ═══════════════════════════════════════════════════════════════════
-function stripAdScripts(html) {
-  return html
-    // Eliminar script tags que carguen tiogolhd o aclib
-    .replace(/<script[^>]*tiogolhd[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*aclib[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*block\.js[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*popads[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*exoclick[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*adsterra[^>]*>[\s\S]*?<\/script>/gi, '')
-    // Eliminar llamadas aclib.runPop inline
-    .replace(/aclib\.runPop\s*\([^)]*\)\s*;?/g, '')
-    .replace(/aclib\.run\w+\s*\([^)]*\)\s*;?/g, '');
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// CARGAR CANAL VÍA PROXY
+// MOTOR PRINCIPAL
 // ═══════════════════════════════════════════════════════════════════
 const frame       = document.getElementById('frame');
 const placeholder = document.getElementById('placeholder');
@@ -268,13 +256,13 @@ const badge       = document.getElementById('badge');
 const badgeTxt    = document.getElementById('badge-txt');
 const proxyStatus = document.getElementById('proxy-status');
 
-let activeIdx  = -1;
-let currentUrl = '';
+let activeIdx   = -1;
+let currentUrl  = '';
 let currentBlob = null;
 
 function showState(s){
   placeholder.style.display = s==='ph'   ? 'flex'  : 'none';
-  loadingEl.classList.toggle('show', s==='load');
+  loadingEl.classList.toggle('show',       s==='load');
   frame.style.display       = s==='play' ? 'block' : 'none';
 }
 
@@ -284,7 +272,7 @@ async function loadChannel(url, idx) {
 
   currentUrl = target;
   document.getElementById('url-input').value = target;
-  loadingTxt.textContent = 'DESCARGANDO Y LIMPIANDO ADS...';
+  loadingTxt.textContent = 'ELIMINANDO ADS...';
   showState('load');
   proxyStatus.textContent = 'PROCESANDO...';
   proxyStatus.style.color = '#ffaa00';
@@ -292,36 +280,33 @@ async function loadChannel(url, idx) {
   if (idx !== undefined) { activeIdx = idx; renderGrid(); }
 
   try {
-    // 1. Descargar HTML via proxy server-side (sin restricciones CORS)
-    const proxyUrl = PROXY + encodeURIComponent(target);
-    const res = await fetch(proxyUrl);
-    if (!res.ok) throw new Error('Proxy error ' + res.status);
-
+    // Descargar HTML via proxy (server-side, sin CORS)
+    const res  = await fetch(PROXY + encodeURIComponent(target));
+    if (!res.ok) throw new Error('proxy ' + res.status);
     const data = await res.json();
-    let html = data.contents;
-    if (!html) throw new Error('Sin contenido');
+    let html   = data.contents;
+    if (!html)  throw new Error('vacío');
 
-    // 2. Eliminar scripts de tiogolhd/aclib directamente del HTML
+    // ── ELIMINAR scripts de ads del HTML ──
     html = stripAdScripts(html);
 
-    // 3. Inyectar base tag para recursos relativos
-    const baseUrl  = new URL(target);
-    const basePath = baseUrl.pathname.replace(/\/[^/]*$/,'/');
-    const baseTag  = `<base href="${baseUrl.origin}${basePath}">`;
+    // ── Arreglar URLs relativas para que los recursos carguen bien ──
+    const orig     = new URL(target);
+    const basePath = orig.pathname.replace(/\/[^/]*$/, '/');
+    const baseTag  = `<base href="${orig.origin}${basePath}">`;
 
-    // 4. Inyectar script anti-ads al inicio del <head>
-    if (html.includes('<head>')) {
-      html = html.replace('<head>', '<head>' + baseTag + AD_KILLER);
-    } else if (html.match(/<head[^>]*>/)) {
-      html = html.replace(/<head[^>]*>/, m => m + baseTag + AD_KILLER);
-    } else {
-      html = '<head>' + baseTag + AD_KILLER + '</head>' + html;
-    }
+    // ── Inyectar base + script anti-ads ──
+    const inject = baseTag + AD_KILLER;
+    if      (html.includes('<head>'))       html = html.replace('<head>', '<head>' + inject);
+    else if (/<head[^>]*>/.test(html))      html = html.replace(/<head[^>]*>/, m => m + inject);
+    else                                    html = '<head>' + inject + '</head>' + html;
 
-    // 5. Servir como blob al iframe
+    // ── Crear blob y cargarlo en el iframe ──
+    // El iframe ahora tiene el HTML limpio pero con base href apuntando
+    // al origen original → el stream .m3u8 se pide a la14hd.com directo
     if (currentBlob) URL.revokeObjectURL(currentBlob);
-    currentBlob = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-    frame.src = currentBlob;
+    currentBlob = URL.createObjectURL(new Blob([html], { type: 'text/html; charset=utf-8' }));
+    frame.src   = currentBlob;
 
     proxyStatus.textContent = '🛡️ ADS ELIMINADOS';
     proxyStatus.style.color = 'var(--accent)';
@@ -330,15 +315,15 @@ async function loadChannel(url, idx) {
     showState('play');
 
   } catch(e) {
-    console.warn('Proxy falló, cargando directo:', e.message);
-    // Fallback: cargar directo (sin bloqueo pero al menos funciona)
+    // Fallback: cargar directo sin proxy
+    console.warn('Proxy falló:', e.message);
     frame.src = target;
     proxyStatus.textContent = '⚠️ DIRECTO';
     proxyStatus.style.color = '#ffaa00';
     badge.classList.add('on');
     badgeTxt.textContent = 'EN VIVO';
     showState('play');
-    toast('⚠️ Proxy no disponible, cargando directo');
+    toast('⚠️ Proxy no disponible, carga directa');
   }
 }
 
@@ -363,27 +348,27 @@ const DEFAULTS = [
 
 let channels = [];
 function loadChannels(){
-  try{ channels=JSON.parse(localStorage.getItem('tvch_v7')||'null')||[...DEFAULTS]; }
+  try{ channels=JSON.parse(localStorage.getItem('tvch_v8')||'null')||[...DEFAULTS]; }
   catch(e){ channels=[...DEFAULTS]; }
 }
-function saveChannels(){ localStorage.setItem('tvch_v7',JSON.stringify(channels)); }
+function saveChannels(){ localStorage.setItem('tvch_v8',JSON.stringify(channels)); }
 
 function renderGrid(){
-  const g=document.getElementById('grid');
-  g.innerHTML=channels.map((ch,i)=>`
+  const g = document.getElementById('grid');
+  g.innerHTML = channels.map((ch,i) => `
     <div class="card ${i===activeIdx?'active':''}" data-i="${i}">
       <div class="c-ico">${ch.icon||'📺'}</div>
       <div class="c-name">${ch.name}</div>
       <div class="c-tag">${ch.tag||'CUSTOM'}</div>
     </div>`).join('');
-  g.querySelectorAll('.card').forEach(card=>{
-    const i=+card.dataset.i;
+  g.querySelectorAll('.card').forEach(card => {
+    const i = +card.dataset.i;
     let timer;
-    card.addEventListener('click',()=>loadChannel(channels[i].url,i));
-    card.addEventListener('touchstart',()=>{timer=setTimeout(()=>delChannel(i),700);},{passive:true});
-    card.addEventListener('touchend',()=>clearTimeout(timer),{passive:true});
-    card.addEventListener('touchmove',()=>clearTimeout(timer),{passive:true});
-    card.addEventListener('contextmenu',e=>{e.preventDefault();delChannel(i);});
+    card.addEventListener('click', () => loadChannel(channels[i].url, i));
+    card.addEventListener('touchstart', () => { timer=setTimeout(()=>delChannel(i),700); },{passive:true});
+    card.addEventListener('touchend',   () => clearTimeout(timer),{passive:true});
+    card.addEventListener('touchmove',  () => clearTimeout(timer),{passive:true});
+    card.addEventListener('contextmenu',e  => { e.preventDefault(); delChannel(i); });
   });
 }
 
@@ -397,9 +382,9 @@ function delChannel(i){
 function openModal() { document.getElementById('modalBg').classList.add('open'); }
 function closeModal(){ document.getElementById('modalBg').classList.remove('open'); }
 function saveChannel(){
-  const name=document.getElementById('mName').value.trim();
-  const url =document.getElementById('mUrl').value.trim();
-  const icon=document.getElementById('mIcon').value.trim()||'📺';
+  const name = document.getElementById('mName').value.trim();
+  const url  = document.getElementById('mUrl').value.trim();
+  const icon = document.getElementById('mIcon').value.trim() || '📺';
   if(!name||!url){ toast('⚠️ Nombre y URL son obligatorios'); return; }
   channels.push({name,url,icon,tag:'CUSTOM'});
   saveChannels(); renderGrid(); closeModal();
@@ -415,7 +400,6 @@ function toast(msg){
   clearTimeout(_tt); _tt=setTimeout(()=>el.classList.remove('show'),2800);
 }
 
-// ── INIT ──
 loadChannels();
 renderGrid();
 showState('ph');
