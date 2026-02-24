@@ -39,7 +39,7 @@
   .btn-go:active{opacity:.8}
   .info-bar{display:flex;align-items:center;padding:7px 14px;gap:8px;font-size:11px;border-bottom:1px solid var(--border);background:rgba(0,229,255,.03);color:var(--muted)}
   .info-bar b{color:var(--accent)}
-  #proxy-status{margin-left:auto;font-size:10px;letter-spacing:1px;background:var(--bg);padding:3px 8px;border-radius:20px;border:1px solid var(--border)}
+  #sw-status{margin-left:auto;font-size:10px;letter-spacing:1px;background:var(--bg);padding:3px 8px;border-radius:20px;border:1px solid var(--border)}
   .sec-label{padding:14px 14px 8px;font-size:10px;font-weight:700;letter-spacing:3px;color:var(--muted)}
   .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:0 12px 12px}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:13px 8px 11px;text-align:center;cursor:pointer;transition:border-color .2s,box-shadow .2s,transform .15s;display:flex;flex-direction:column;align-items:center;gap:5px}
@@ -76,12 +76,6 @@
       <div class="ph-txt">SELECCIONÁ UN CANAL</div>
     </div>
     <div id="loading"><div class="spinner"></div><div class="loading-txt" id="loading-txt">CARGANDO...</div></div>
-    <!--
-      CLAVE: el iframe apunta DIRECTO a la URL original (la14hd.com)
-      El HTML que recibe ya viene limpio — el proxy eliminó los scripts
-      de tiogolhd ANTES de que lleguen al navegador.
-      Así el stream .m3u8 carga desde su origen correcto sin errores.
-    -->
     <iframe id="frame" style="display:none"
       allowfullscreen
       allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
@@ -93,8 +87,8 @@
     <button class="btn-go" onclick="loadChannel()">▶ IR</button>
   </div>
   <div class="info-bar">
-    <span>🛡️ <b>Proxy anti-ads</b></span>
-    <span id="proxy-status">LISTO</span>
+    <span>🛡️ <b>Bloqueador de red</b></span>
+    <span id="sw-status">INICIANDO...</span>
   </div>
   <div class="sec-label">CANALES RÁPIDOS</div>
   <div class="grid" id="grid"></div>
@@ -118,135 +112,41 @@
 <script>
 'use strict';
 
-// ═══════════════════════════════════════════════════════════════════
-// PROXY CORS gratuito — descarga el HTML server-side
-// ═══════════════════════════════════════════════════════════════════
-const PROXY = 'https://api.allorigins.win/get?url=';
+const swStatus = document.getElementById('sw-status');
 
 // ═══════════════════════════════════════════════════════════════════
-// PASO 1: Eliminar scripts de ads del HTML crudo (regex)
-// Se hace ANTES de que el navegador los vea — nunca llegan a ejecutar
+// REGISTRAR SERVICE WORKER desde archivo sw.js de GitHub Pages
+// Desde HTTPS con dominio propio funciona perfectamente
 // ═══════════════════════════════════════════════════════════════════
-function stripAdScripts(html) {
-  return html
-    // Eliminar cualquier <script> que cargue tiogolhd o aclib
-    .replace(/<script[^>]*tiogolhd[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*aclib[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*block\.js[^>]*>[\s\S]*?<\/script>/gi, '')
-    // Eliminar otros ad networks conocidos
-    .replace(/<script[^>]*popads\.net[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*exoclick[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*adsterra[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*propellerads[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*hilltopads[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*trafficjunky[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*clickadu[^>]*>[\s\S]*?<\/script>/gi, '')
-    // Eliminar llamadas inline a aclib
-    .replace(/aclib\.run\w*\s*\(\s*\{[\s\S]*?\}\s*\)\s*;?/g, '')
-    // Eliminar iframes de ads
-    .replace(/<iframe[^>]*tiogolhd[^>]*>[\s\S]*?<\/iframe>/gi, '')
-    .replace(/<iframe[^>]*popads[^>]*>[\s\S]*?<\/iframe>/gi, '');
+async function registerSW() {
+  if (!('serviceWorker' in navigator)) {
+    swStatus.textContent = '⚠️ NO SOPORTADO';
+    swStatus.style.color = 'var(--accent2)';
+    return;
+  }
+  try {
+    // sw.js está en la raíz del repo — mismo dominio que esta página
+    const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
+    await navigator.serviceWorker.ready;
+    swStatus.textContent = '🛡️ ACTIVO';
+    swStatus.style.color = 'var(--accent)';
+    swStatus.style.borderColor = 'var(--accent)';
+    console.log('SW activo:', reg.scope);
+  } catch(e) {
+    swStatus.textContent = '⚠️ ERROR: ' + e.message;
+    swStatus.style.color = 'var(--accent2)';
+    console.error('SW error:', e);
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// PASO 2: Script que se inyecta DENTRO del HTML limpio
-// Por si queda algún ad dinámico que se inyecte después de cargar
-// ═══════════════════════════════════════════════════════════════════
-const AD_KILLER = `<script>
-(function(){
-  if(window.__ak) return;
-  window.__ak = true;
-
-  /* Neutralizar aclib por si quedó alguna referencia */
-  window.aclib = { runPop:function(){}, runBanner:function(){},
-                   runInterstitial:function(){}, runSlider:function(){} };
-
-  /* Sin popups */
-  window.open = function(){ return null; };
-
-  /* Interceptar createElement para bloquear scripts inyectados dinámicamente */
-  var _ce = document.createElement.bind(document);
-  document.createElement = function(tag){
-    var el = _ce(tag);
-    if((tag+'').toLowerCase() === 'script'){
-      Object.defineProperty(el, 'src', {
-        set: function(v){
-          if(v && (v.indexOf('tiogolhd')>-1 || v.indexOf('aclib')>-1 ||
-             v.indexOf('popads')>-1 || v.indexOf('exoclick')>-1 ||
-             v.indexOf('adsterra')>-1 || v.indexOf('hilltopads')>-1)){
-            return; /* bloqueado */
-          }
-          Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,'src').set.call(this,v);
-        },
-        get: function(){
-          return Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,'src').get.call(this);
-        }
-      });
-    }
-    return el;
-  };
-
-  /* Eliminar capas de publicidad del DOM */
-  function isPlayer(el){
-    var s = ((el.id||'')+(el.className||'')).toLowerCase();
-    return el.tagName==='VIDEO'||el.tagName==='AUDIO'||
-           (el.querySelector&&!!el.querySelector('video'))||
-           s.indexOf('player')>-1||s.indexOf('jw-')>-1||s.indexOf('vjs')>-1;
-  }
-  function killAds(){
-    if(!document.body) return;
-    document.querySelectorAll('div,section,aside').forEach(function(el){
-      if(isPlayer(el)) return;
-      try{
-        var st = getComputedStyle(el);
-        if(st.display==='none') return;
-        var zi = parseInt(st.zIndex)||0;
-        if((st.position==='fixed'||st.position==='absolute') && zi>5){
-          var r = el.getBoundingClientRect();
-          if(r.width < window.innerWidth*0.25 || r.height < window.innerHeight*0.25) return;
-          if(isPlayer(el)) return;
-          var hasExt = Array.from(el.querySelectorAll('a[href]')).some(function(a){
-            var h = a.getAttribute('href')||'';
-            return h && h.indexOf('javascript')===-1 &&
-                   h.indexOf(location.hostname)===-1 && /^https?:/.test(h);
-          });
-          if(hasExt || zi > 50){
-            el.style.cssText = 'display:none!important;pointer-events:none!important';
-            try{ el.remove(); }catch(e){}
-          }
-        }
-      }catch(e){}
-    });
-  }
-
-  /* Bloquear clicks en links externos */
-  document.addEventListener('click', function(e){
-    var t = e.target;
-    for(var i=0;i<8;i++){
-      if(!t || t===document.body) break;
-      if(t.tagName==='A'){
-        var h = t.getAttribute('href')||'';
-        if(h && h.indexOf('javascript')===-1 && h.indexOf('#')===-1 &&
-           h.indexOf(location.hostname)===-1 && /^https?:/.test(h)){
-          e.preventDefault(); e.stopImmediatePropagation(); return;
-        }
-      }
-      t = t.parentElement;
-    }
-  }, true);
-
-  killAds();
-  setInterval(killAds, 500);
-  var mo = new MutationObserver(function(m){
-    m.forEach(function(r){ if(r.addedNodes.length) setTimeout(killAds,60); });
-  });
-  function obs(){ if(document.body) mo.observe(document.body,{childList:true,subtree:true}); }
-  document.body ? obs() : document.addEventListener('DOMContentLoaded', obs);
-})();
-<\/script>`;
+// Bloqueo adicional en el padre
+window.open = () => null;
+window.addEventListener('blur', () => setTimeout(() => { try{ window.focus(); }catch(e){} }, 150));
 
 // ═══════════════════════════════════════════════════════════════════
-// MOTOR PRINCIPAL
+// PLAYER — carga el canal DIRECTO en el iframe
+// El Service Worker intercepta las peticiones de tiogolhd.com
+// y devuelve vacío — el stream .m3u8 pasa sin problemas
 // ═══════════════════════════════════════════════════════════════════
 const frame       = document.getElementById('frame');
 const placeholder = document.getElementById('placeholder');
@@ -254,11 +154,8 @@ const loadingEl   = document.getElementById('loading');
 const loadingTxt  = document.getElementById('loading-txt');
 const badge       = document.getElementById('badge');
 const badgeTxt    = document.getElementById('badge-txt');
-const proxyStatus = document.getElementById('proxy-status');
 
-let activeIdx   = -1;
-let currentUrl  = '';
-let currentBlob = null;
+let activeIdx = -1;
 
 function showState(s){
   placeholder.style.display = s==='ph'   ? 'flex'  : 'none';
@@ -270,61 +167,20 @@ async function loadChannel(url, idx) {
   const target = url || document.getElementById('url-input').value.trim();
   if (!target) { toast('⚠️ Ingresá una URL'); return; }
 
-  currentUrl = target;
   document.getElementById('url-input').value = target;
-  loadingTxt.textContent = 'ELIMINANDO ADS...';
+  loadingTxt.textContent = 'CARGANDO STREAM...';
   showState('load');
-  proxyStatus.textContent = 'PROCESANDO...';
-  proxyStatus.style.color = '#ffaa00';
 
   if (idx !== undefined) { activeIdx = idx; renderGrid(); }
 
-  try {
-    // Descargar HTML via proxy (server-side, sin CORS)
-    const res  = await fetch(PROXY + encodeURIComponent(target));
-    if (!res.ok) throw new Error('proxy ' + res.status);
-    const data = await res.json();
-    let html   = data.contents;
-    if (!html)  throw new Error('vacío');
+  // Cargar directo — el SW bloquea los ads a nivel de red
+  frame.src = 'about:blank';
+  await new Promise(r => setTimeout(r, 100));
+  frame.src = target;
 
-    // ── ELIMINAR scripts de ads del HTML ──
-    html = stripAdScripts(html);
-
-    // ── Arreglar URLs relativas para que los recursos carguen bien ──
-    const orig     = new URL(target);
-    const basePath = orig.pathname.replace(/\/[^/]*$/, '/');
-    const baseTag  = `<base href="${orig.origin}${basePath}">`;
-
-    // ── Inyectar base + script anti-ads ──
-    const inject = baseTag + AD_KILLER;
-    if      (html.includes('<head>'))       html = html.replace('<head>', '<head>' + inject);
-    else if (/<head[^>]*>/.test(html))      html = html.replace(/<head[^>]*>/, m => m + inject);
-    else                                    html = '<head>' + inject + '</head>' + html;
-
-    // ── Crear blob y cargarlo en el iframe ──
-    // El iframe ahora tiene el HTML limpio pero con base href apuntando
-    // al origen original → el stream .m3u8 se pide a la14hd.com directo
-    if (currentBlob) URL.revokeObjectURL(currentBlob);
-    currentBlob = URL.createObjectURL(new Blob([html], { type: 'text/html; charset=utf-8' }));
-    frame.src   = currentBlob;
-
-    proxyStatus.textContent = '🛡️ ADS ELIMINADOS';
-    proxyStatus.style.color = 'var(--accent)';
-    badge.classList.add('on');
-    badgeTxt.textContent = 'EN VIVO';
-    showState('play');
-
-  } catch(e) {
-    // Fallback: cargar directo sin proxy
-    console.warn('Proxy falló:', e.message);
-    frame.src = target;
-    proxyStatus.textContent = '⚠️ DIRECTO';
-    proxyStatus.style.color = '#ffaa00';
-    badge.classList.add('on');
-    badgeTxt.textContent = 'EN VIVO';
-    showState('play');
-    toast('⚠️ Proxy no disponible, carga directa');
-  }
+  badge.classList.add('on');
+  badgeTxt.textContent = 'EN VIVO';
+  setTimeout(() => showState('play'), 2000);
 }
 
 frame.addEventListener('load', () => {
@@ -348,10 +204,10 @@ const DEFAULTS = [
 
 let channels = [];
 function loadChannels(){
-  try{ channels=JSON.parse(localStorage.getItem('tvch_v8')||'null')||[...DEFAULTS]; }
+  try{ channels=JSON.parse(localStorage.getItem('tvch_v9')||'null')||[...DEFAULTS]; }
   catch(e){ channels=[...DEFAULTS]; }
 }
-function saveChannels(){ localStorage.setItem('tvch_v8',JSON.stringify(channels)); }
+function saveChannels(){ localStorage.setItem('tvch_v9',JSON.stringify(channels)); }
 
 function renderGrid(){
   const g = document.getElementById('grid');
@@ -400,9 +256,11 @@ function toast(msg){
   clearTimeout(_tt); _tt=setTimeout(()=>el.classList.remove('show'),2800);
 }
 
+// INIT
 loadChannels();
 renderGrid();
 showState('ph');
+registerSW();
 </script>
 </body>
 </html>
